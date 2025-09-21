@@ -1,6 +1,6 @@
 // src/lib/helpers.js
 import { Buffer } from "buffer";
-import cookie from "cookie";
+import * as cookie from "cookie";
 import crypto from "crypto";
 
 export function base64UrlEncode(str) {

@@ -16,25 +16,30 @@ export async function POST(req) {
     return jsonResponse({ error: "Invalid request, pass messages" }, 400);
   }
 
-  // System prompt
+  // Improved system prompt with clearer instructions
   const system = `
-You are a ReAct-style assistant. When you want to use a tool, respond with EXACTLY this JSON structure (no extra text):
+You are a Gmail assistant that uses tools to help users. Follow these rules EXACTLY:
 
+1. When you need to use a tool, respond with ONLY this JSON (no extra text):
 {"type":"action","action":"<tool_name>","args":{...}}
 
-For example, to create a draft:
-{"type":"action","action":"gmail_create_draft","args":{"to":"user@example.com","subject":"Meeting","body":"Email content"}}
+2. After getting tool results, you MUST respond with:
+{"type":"final","content":"Your helpful response to the user based on the results"}
 
-Supported tools:
-- gmail_search (args: { "query":string, "maxResults":int })
-- gmail_get_message (args: { "messageId":string, "format": "full"|"raw"|"metadata" })
-- gmail_create_draft (args: { "to":string, "subject":string, "body":string })
-- gmail_send (args: { "draftId":string, "confirmed":boolean })
+Available tools:
+- gmail_search: Search emails (args: { "query": string, "maxResults": number })
+- gmail_get_message: Get email details (args: { "messageId": string, "format": "full"|"metadata" })
+- gmail_create_draft: Create draft email (args: { "to": string, "subject": string, "body": string })
+- gmail_send: Send draft (args: { "draftId": string, "confirmed": boolean })
 
-When you are done, respond with:
-{"type":"final","content":"Your final message to the user"}
+Examples:
+User: "Show me my latest emails"
+Assistant: {"type":"action","action":"gmail_search","args":{"query":"in:inbox","maxResults":5}}
 
-IMPORTANT: Always use "type":"action" for tool calls, never use the tool name as the type.
+After tool result:
+Assistant: {"type":"final","content":"Here are your latest 5 emails: [summarize results]"}
+
+CRITICAL: Always end with type:"final" after tool execution. Never create multiple drafts or repeat actions.
 `;
 
   const conv = [
@@ -42,28 +47,56 @@ IMPORTANT: Always use "type":"action" for tool calls, never use the tool name as
     ...body.messages.map((m) => ({ role: m.role, content: m.content })),
   ];
 
-  for (let step = 0; step < 6; step++) {
+  for (let step = 0; step < 8; step++) { // Increased to 8 steps
     const llmRespText = await callOpenRouter(conv);
 
     let actionObj = null;
     try {
-      const jsonStart = llmRespText.indexOf("{");
-      const json = jsonStart >= 0 ? llmRespText.slice(jsonStart) : llmRespText;
-      actionObj = JSON.parse(json);
-    } catch {
-      conv.push({ role: "assistant", content: llmRespText });
-      return jsonResponse(
-        { error: "Model did not return valid action JSON", raw: llmRespText },
-        500
-      );
+      // Better JSON extraction
+      let jsonText = llmRespText.trim();
+      const jsonStart = jsonText.indexOf("{");
+      const jsonEnd = jsonText.lastIndexOf("}");
+      
+      if (jsonStart >= 0 && jsonEnd > jsonStart) {
+        jsonText = jsonText.slice(jsonStart, jsonEnd + 1);
+      }
+      
+      actionObj = JSON.parse(jsonText);
+    } catch (parseError) {
+      // If JSON parsing fails, try to create a final response
+      console.log("JSON parse error:", parseError, "Raw response:", llmRespText);
+      
+      // If it looks like a regular text response, wrap it as final
+      if (!llmRespText.includes("{") && !llmRespText.includes("}")) {
+        return jsonResponse({ 
+          type: "final", 
+          content: llmRespText.trim() 
+        });
+      }
+      
+      // Otherwise return the parsing error
+      return jsonResponse({
+        error: "Model did not return valid JSON",
+        raw: llmRespText,
+        step: step + 1
+      }, 500);
     }
 
+    // Handle final response
     if (actionObj.type === "final") {
       return jsonResponse({ type: "final", content: actionObj.content });
     }
 
+    // Handle tool actions
     if (actionObj.type === "action") {
       const { action, args } = actionObj;
+      
+      // Add the action to conversation history
+      conv.push({ 
+        role: "assistant", 
+        content: JSON.stringify(actionObj) 
+      });
+      
       try {
         let toolResult;
         switch (action) {
@@ -95,51 +128,57 @@ IMPORTANT: Always use "type":"action" for tool calls, never use the tool name as
             });
             break;
           default:
-            toolResult = { error: "UNKNOWN_TOOL" };
+            toolResult = { error: "UNKNOWN_TOOL: " + action };
         }
 
+        // Handle authentication required
         if (
           toolResult === "AUTH_REQUIRED" ||
           (toolResult && toolResult.error === "AUTH_REQUIRED")
         ) {
-          conv.push({
-            role: "assistant",
-            content: `{"observation":"AUTH_REQUIRED"}`,
-          });
           return jsonResponse({ error: "AUTH_REQUIRED" }, 401);
         }
 
+        // Handle confirmation needed for email sending
         if (toolResult && toolResult.need_confirmation) {
           return jsonResponse({
             type: "confirm_send",
             draftId: toolResult.draftId,
-            message:
-              "Agent requests confirmation to send draft. Click Confirm to send.",
+            message: "I've prepared your email draft. Click Confirm to send it.",
           });
         }
 
-        const obsString = JSON.stringify(toolResult, null, 2);
+        // Add tool result to conversation with clear instruction to respond
+        const toolObservation = JSON.stringify(toolResult, null, 2);
         conv.push({
-          role: "assistant",
-          content: `{"observation": ${JSON.stringify(obsString)} }`,
+          role: "user",
+          content: `Tool result: ${toolObservation}\n\nNow respond to the user with {"type":"final","content":"your response"} based on this result.`
         });
+
       } catch (err) {
         if (err?.message?.includes("AUTH_REQUIRED")) {
           return jsonResponse({ error: "AUTH_REQUIRED" }, 401);
         }
-        const errObs = { error: String(err?.message ?? err) };
+        
+        // Add error to conversation and let the model handle it
+        const errorMsg = String(err?.message ?? err);
         conv.push({
-          role: "assistant",
-          content: `{"observation": ${JSON.stringify(JSON.stringify(errObs))}}`,
+          role: "user",
+          content: `Tool error: ${errorMsg}\n\nRespond to the user with {"type":"final","content":"explanation of the error"}`
         });
       }
     } else {
-      return jsonResponse(
-        { error: "Unknown action type from model", actionObj },
-        500
-      );
+      return jsonResponse({
+        error: "Unknown action type from model",
+        actionObj,
+        step: step + 1
+      }, 500);
     }
   }
 
-  return jsonResponse({ error: "Max steps reached" }, 500);
+  // If we hit max steps, return a helpful message instead of an error
+  return jsonResponse({ 
+    type: "final", 
+    content: "I apologize, but I'm having trouble completing that request. Please try rephrasing your question or break it into smaller parts."
+  });
 }
